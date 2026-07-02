@@ -95,7 +95,27 @@ if [ "${CYBORG_SKIP_RESTART:-0}" != "1" ] && "$BIN_DIR/cyborg" daemon status >/d
   step "Restarting the running daemon to apply the update"
   if command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet cyborg7-daemon || systemctl --user is-active --quiet cyborg7-daemon; } 2>/dev/null; then
     # systemd-managed: the unit's ExecStart must pass `cyborg daemon start --replace`
-    # (see docs) so a restart reaps the stale build instead of no-opping.
+    # so a restart reaps the stale build instead of no-opping. Units written BEFORE
+    # the flag existed don't have it, which made `systemctl restart` a silent no-op
+    # (`daemon start` saw "already running" and exited) — the old build kept serving
+    # and the user still needed a MANUAL `cyborg daemon restart` after every update.
+    # MIGRATE such units in place (idempotent: only touches an ExecStart that runs
+    # `cyborg daemon start` without --replace; scoped to this unit file, so a
+    # coexisting genuine-Paseo daemon is never affected), then daemon-reload.
+    migrate_unit() { # $1 = unit file path, $2 = optional command prefix ("sudo -n")
+      [ -n "$1" ] && [ -f "$1" ] || return 1
+      grep -qE '^ExecStart=.*cyborg daemon start' "$1" || return 1
+      grep -qE '^ExecStart=.*--replace' "$1" && return 1
+      ${2:-} sed -i '/^ExecStart=.*cyborg daemon start/ s/[[:space:]]*$/ --replace/' "$1" 2>/dev/null || return 1
+      step "Migrated systemd unit to 'daemon start --replace' (updates now apply without manual restarts)"
+    }
+    if systemctl is-active --quiet cyborg7-daemon 2>/dev/null; then
+      UNIT_PATH=$(systemctl show -p FragmentPath --value cyborg7-daemon 2>/dev/null)
+      migrate_unit "$UNIT_PATH" "sudo -n" && sudo -n systemctl daemon-reload 2>/dev/null
+    elif systemctl --user is-active --quiet cyborg7-daemon 2>/dev/null; then
+      UNIT_PATH=$(systemctl --user show -p FragmentPath --value cyborg7-daemon 2>/dev/null)
+      migrate_unit "$UNIT_PATH" && systemctl --user daemon-reload 2>/dev/null
+    fi
     { sudo -n systemctl restart cyborg7-daemon 2>/dev/null \
       || systemctl --user restart cyborg7-daemon 2>/dev/null \
       || "$BIN_DIR/cyborg" daemon restart --force 2>/dev/null; } \
