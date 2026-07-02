@@ -88,6 +88,24 @@ exec "$APP_DIR/app/node/bin/node" "$APP_DIR/app/dist/cyborg.js" "\$@"
 EOF
 chmod +x "$BIN_DIR/cyborg"
 
+# Apply the update to a RUNNING daemon — otherwise the new bundle just sits on disk
+# while the old process keeps serving (the "I updated but nothing changed" bug). Skip
+# with CYBORG_SKIP_RESTART=1. Best-effort: a restart failure never fails the install.
+if [ "${CYBORG_SKIP_RESTART:-0}" != "1" ] && "$BIN_DIR/cyborg" daemon status >/dev/null 2>&1; then
+  step "Restarting the running daemon to apply the update"
+  if command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet cyborg7-daemon || systemctl --user is-active --quiet cyborg7-daemon; } 2>/dev/null; then
+    # systemd-managed: the unit's ExecStart must pass `cyborg daemon start --replace`
+    # (see docs) so a restart reaps the stale build instead of no-opping.
+    { sudo -n systemctl restart cyborg7-daemon 2>/dev/null \
+      || systemctl --user restart cyborg7-daemon 2>/dev/null \
+      || "$BIN_DIR/cyborg" daemon restart --force 2>/dev/null; } \
+      || step "Could not auto-restart — run: cyborg daemon restart"
+  else
+    "$BIN_DIR/cyborg" daemon restart --force 2>/dev/null \
+      || step "Could not auto-restart — run: cyborg daemon restart"
+  fi
+fi
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) on_path=1 ;;
   *) on_path=0 ;;
