@@ -82,8 +82,14 @@ tar -xzf "$tmp/$archive" -C "$APP_DIR"
 
 step "Writing launcher to $BIN_DIR/cyborg"
 mkdir -p "$BIN_DIR"
+# Export CYBORG7_DOCS_DIR so the daemon's cyborg7_read_docs MCP tool finds the
+# bundled Markdown corpus. @cyborg7/docs-lib's walk-up would also resolve it
+# (the corpus ships at app/packages/docs/src/content/docs), but pinning it here
+# is deterministic and survives any node_modules hoist-layout change. The daemon
+# spawned by `cyborg daemon start` inherits this env from the launcher.
 cat >"$BIN_DIR/cyborg" <<EOF
 #!/bin/sh
+export CYBORG7_DOCS_DIR="\${CYBORG7_DOCS_DIR:-$APP_DIR/app/packages/docs/src/content/docs}"
 exec "$APP_DIR/app/node/bin/node" "$APP_DIR/app/dist/cyborg.js" "\$@"
 EOF
 chmod +x "$BIN_DIR/cyborg"
