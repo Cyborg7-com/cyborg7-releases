@@ -90,6 +90,12 @@ mkdir -p "$BIN_DIR"
 cat >"$BIN_DIR/cyborg" <<EOF
 #!/bin/sh
 export CYBORG7_DOCS_DIR="\${CYBORG7_DOCS_DIR:-$APP_DIR/app/packages/docs/src/content/docs}"
+# Export CYBORG7_SOURCE_DIR so the daemon's cyborg7_read_source MCP tool finds the
+# bundled read-only source snapshot. The tool is git-checkout-gated by default and
+# this bundle has no .git, so without this it would never register (CYBORG-85);
+# @cyborg7/docs-lib trusts this override without requiring .git. The repo-scoped
+# path guard + secret denylist still apply to every read under it.
+export CYBORG7_SOURCE_DIR="\${CYBORG7_SOURCE_DIR:-$APP_DIR/app/source-snapshot}"
 exec "$APP_DIR/app/node/bin/node" "$APP_DIR/app/dist/cyborg.js" "\$@"
 EOF
 chmod +x "$BIN_DIR/cyborg"
