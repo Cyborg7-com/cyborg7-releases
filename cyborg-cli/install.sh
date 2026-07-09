@@ -16,6 +16,14 @@ VERSION="${1:-latest}"
 BIN_DIR="${CYBORG_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 APP_DIR="${CYBORG_INSTALL_APP_DIR:-$HOME/.local/share/cyborg-cli}"
 SKIP_PATH_UPDATE="${CYBORG_INSTALL_SKIP_PATH_UPDATE:-0}"
+# The systemd unit provisioned below (CYBORG-81) so the headless daemon auto-starts
+# on boot and self-heals on crash. Opt out with CYBORG_SKIP_SYSTEMD=1.
+UNIT_NAME="cyborg7-daemon"
+SKIP_SYSTEMD="${CYBORG_SKIP_SYSTEMD:-0}"
+# Set to 1 once the unit is installed AND enabled, so the closing message reports
+# systemd management instead of the manual-start hint (a bare `command -v systemctl`
+# is not enough: systemd can be present yet the user manager unreachable / enable fail).
+SYSTEMD_PROVISIONED=0
 
 step() { printf '==> %s\n' "$1"; }
 die() { printf 'error: %s\n' "$1" >&2; exit 1; }
@@ -100,6 +108,127 @@ exec "$APP_DIR/app/node/bin/node" "$APP_DIR/app/dist/cyborg.js" "\$@"
 EOF
 chmod +x "$BIN_DIR/cyborg"
 
+# Render the systemd unit body. $1 = ABSOLUTE launcher path, $2 = WantedBy target.
+# The executable is double-quoted so a path containing spaces (e.g. a custom
+# CYBORG_INSTALL_BIN_DIR under "Application Support") still parses — systemd requires
+# an absolute ExecStart and treats an unquoted space as an argument separator. The
+# ExecStart MUST pass `daemon start --replace` so that a later update reaps the old
+# daemon instead of no-opping (a plain `daemon start` sees "already running" and
+# exits, leaving the stale build serving); `--foreground` hands the process
+# lifecycle to systemd (Type=simple). Restart=on-failure + the StartLimit* pair
+# trip a crash-looping daemon to a visible `failed` state instead of hammering
+# restarts (mirrors the relay unit's guardrails).
+render_unit() {
+  cat <<EOF
+[Unit]
+Description=Cyborg7 headless daemon
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart="$1" daemon start --replace --foreground
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=$2
+EOF
+}
+
+# Provision (create/update + enable) the systemd unit so the headless daemon starts
+# on boot and restarts on crash. Prefers USER scope (no root needed); uses SYSTEM
+# scope only when the installer runs as root. Idempotent: a byte-identical unit is a
+# no-op; a drifted one is rewritten + daemon-reloaded. Degrades gracefully (prints a
+# manual-start hint) when systemd isn't available — e.g. a container without an init.
+provision_systemd_unit() {
+  [ "$SKIP_SYSTEMD" = "1" ] && return 0
+  if ! command -v systemctl >/dev/null 2>&1; then
+    step "systemd not detected — skipping unit install (daemon won't auto-start on boot)."
+    step "Start it manually with:  cyborg daemon start --foreground"
+    return 0
+  fi
+
+  # systemd requires an ABSOLUTE ExecStart path. BIN_DIR defaults to an absolute
+  # $HOME/.local/bin, but a custom CYBORG_INSTALL_BIN_DIR may be relative — resolve
+  # it so the unit is valid regardless. realpath/readlink first, then a $PWD anchor.
+  launcher="$BIN_DIR/cyborg"
+  if command -v realpath >/dev/null 2>&1; then
+    launcher="$(realpath "$launcher" 2>/dev/null || printf '%s' "$launcher")"
+  elif command -v readlink >/dev/null 2>&1; then
+    resolved="$(readlink -f "$launcher" 2>/dev/null || true)"
+    [ -n "$resolved" ] && launcher="$resolved"
+  fi
+  case "$launcher" in
+    /*) ;;
+    *) launcher="$(pwd)/$launcher" ;;
+  esac
+
+  uid="$(id -u 2>/dev/null || echo 1000)"
+
+  if [ "$uid" = "0" ]; then
+    scope="system"
+    unit_dir="/etc/systemd/system"
+    wanted="multi-user.target"
+  else
+    scope="user"
+    unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    wanted="default.target"
+    # A per-user manager must be reachable (it is NOT in a bare container, a
+    # `docker exec` without a user bus, or a non-interactive session with no
+    # DBUS_SESSION_BUS_ADDRESS). Probe defensively and fall back GRACEFULLY to the
+    # manual hint — never leave a half-enabled unit or fail the install. is-system-
+    # running answers whenever the manager is reachable (even in a `degraded` state);
+    # show-environment is the fallback probe when that subcommand is unavailable.
+    if ! systemctl --user is-system-running >/dev/null 2>&1 \
+      && ! systemctl --user show-environment >/dev/null 2>&1; then
+      step "systemd user manager not reachable — skipping unit install."
+      step "Start it manually with:  cyborg daemon start --foreground"
+      return 0
+    fi
+  fi
+
+  unit_path="$unit_dir/${UNIT_NAME}.service"
+  desired="$(render_unit "$launcher" "$wanted")"
+
+  if [ -f "$unit_path" ] && [ "$(cat "$unit_path" 2>/dev/null)" = "$desired" ]; then
+    step "systemd unit already up to date ($unit_path)"
+  else
+    step "Installing systemd unit ($scope scope) at $unit_path"
+    mkdir -p "$unit_dir" 2>/dev/null || true
+    printf '%s\n' "$desired" >"$unit_path" 2>/dev/null || { step "Could not write $unit_path — skipping unit install (run: cyborg daemon start --foreground)."; return 0; }
+  fi
+
+  # Resolve the username defensively, same care as the UID above (`id` can be absent
+  # or fail in a minimal image) — used for the enable-linger hint/call.
+  user_name="$(id -un 2>/dev/null || printf '%s' "${USER:-${LOGNAME:-$uid}}")"
+
+  if [ "$scope" = "user" ]; then
+    systemctl --user daemon-reload >/dev/null 2>&1 || true
+    # enable-linger so the user service starts at boot without an active login. Needs
+    # privilege on most distros; best-effort, non-fatal (the daemon still starts on
+    # login, and auto-restarts, without it).
+    loginctl enable-linger "$user_name" >/dev/null 2>&1 \
+      || step "note: enable linger for boot-start:  sudo loginctl enable-linger $user_name"
+    if systemctl --user enable --now "${UNIT_NAME}.service" >/dev/null 2>&1; then
+      SYSTEMD_PROVISIONED=1
+      step "Enabled + started $UNIT_NAME (systemctl --user)"
+    else
+      step "Could not enable the unit — start it with:  systemctl --user start $UNIT_NAME"
+    fi
+  else
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl enable --now "${UNIT_NAME}.service" >/dev/null 2>&1; then
+      SYSTEMD_PROVISIONED=1
+      step "Enabled + started $UNIT_NAME (system scope)"
+    else
+      step "Could not enable the unit — start it with:  systemctl start $UNIT_NAME"
+    fi
+  fi
+}
+
 # Apply the update to a RUNNING daemon — otherwise the new bundle just sits on disk
 # while the old process keeps serving (the "I updated but nothing changed" bug). Skip
 # with CYBORG_SKIP_RESTART=1. Best-effort: a restart failure never fails the install.
@@ -138,6 +267,14 @@ if [ "${CYBORG_SKIP_RESTART:-0}" != "1" ] && "$BIN_DIR/cyborg" daemon status >/d
   fi
 fi
 
+# Provision the systemd unit so the daemon auto-starts on boot and self-heals on
+# crash. Runs AFTER the update-restart above: on an update the running daemon was
+# already cycled to the new build; here we only ensure the unit exists (installing
+# it on a first-time host) and enable it. `enable --now` starts the daemon on a
+# fresh install where nothing was running yet (the restart block was skipped). The
+# ExecStart's `--replace` makes systemd take over any daemon started by hand.
+provision_systemd_unit
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) on_path=1 ;;
   *) on_path=0 ;;
@@ -156,4 +293,9 @@ if [ "$on_path" = "0" ] && [ "$SKIP_PATH_UPDATE" != "1" ]; then
 fi
 
 step "Done. Restart your shell (or run: export PATH=\"$BIN_DIR:\$PATH\")"
-step "Then run a headless agent host with:  cyborg daemon start --foreground"
+if [ "$SYSTEMD_PROVISIONED" = "1" ]; then
+  step "The headless daemon is managed by systemd ($UNIT_NAME) — it auto-starts on boot."
+  step "Check it with:  systemctl --user status $UNIT_NAME   (or 'systemctl status' when installed as root)"
+else
+  step "Then run a headless agent host with:  cyborg daemon start --foreground"
+fi
