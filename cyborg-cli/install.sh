@@ -108,7 +108,8 @@ exec "$APP_DIR/app/node/bin/node" "$APP_DIR/app/dist/cyborg.js" "\$@"
 EOF
 chmod +x "$BIN_DIR/cyborg"
 
-# Render the systemd unit body. $1 = ABSOLUTE launcher path, $2 = WantedBy target.
+# Render the systemd unit body. $1 = ABSOLUTE launcher path, $2 = WantedBy target,
+# $3 = ABSOLUTE operator env-file path.
 # The executable is double-quoted so a path containing spaces (e.g. a custom
 # CYBORG_INSTALL_BIN_DIR under "Application Support") still parses — systemd requires
 # an absolute ExecStart and treats an unquoted space as an argument separator. The
@@ -118,6 +119,19 @@ chmod +x "$BIN_DIR/cyborg"
 # lifecycle to systemd (Type=simple). Restart=on-failure + the StartLimit* pair
 # trip a crash-looping daemon to a visible `failed` state instead of hammering
 # restarts (mirrors the relay unit's guardrails).
+#
+# EnvironmentFile (CYBORG-871) is how an operator gives the daemon secrets — chiefly
+# CYBORG7_CRED_KEY, the credential-store master key, whose whole point is to live
+# somewhere other than the folder it decrypts. It CANNOT be an `Environment=` line
+# here: provision_systemd_unit byte-compares this rendered text against the on-disk
+# unit and rewrites any difference, so a hand-added `Environment=` was silently
+# deleted by the next `install.sh` run — and the daemon then came up with no key.
+# The referenced file is created once by ensure_daemon_env_file and NEVER rewritten,
+# so it survives every update. The `-` prefix marks it optional: a deleted file
+# leaves the unit starting normally rather than failing to load. Left unquoted on
+# purpose — systemd's quote handling for a prefixed path is not worth relying on,
+# and a path with a space degrades to "optional file not found" (the daemon still
+# starts) instead of an ExecStart-style hard parse failure.
 render_unit() {
   cat <<EOF
 [Unit]
@@ -129,6 +143,7 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
+EnvironmentFile=-$3
 ExecStart="$1" daemon start --replace --foreground
 Restart=on-failure
 RestartSec=5
@@ -136,6 +151,34 @@ RestartSec=5
 [Install]
 WantedBy=$2
 EOF
+}
+
+# Create the operator-owned env file ONCE, 0600, and never touch it again. $1 = path.
+# This installer manages the unit; it deliberately does not manage this file, which is
+# the entire reason a secret put here survives an update.
+ensure_daemon_env_file() {
+  [ -f "$1" ] && return 0
+  mkdir -p "${1%/*}" 2>/dev/null || true
+  # Create empty first, then tighten, then fill: the window where the mode is still
+  # the default holds no bytes.
+  : >"$1" 2>/dev/null || return 0
+  chmod 600 "$1" 2>/dev/null || true
+  cat >>"$1" <<'ENVEOF' || true
+# Cyborg7 daemon environment — read by the cyborg7-daemon systemd unit.
+# The installer creates this file once and NEVER rewrites it, so anything set here
+# survives a `cyborg` update. One KEY=VALUE per line, no `export`, no quoting.
+#
+# CYBORG7_CRED_KEY: base64 of 32 random bytes (`openssl rand -base64 32`). Moves the
+# credential-store master key out of ~/.cyborg7 entirely (CYBORG-921 already moved it
+# off ~/.cyborg7/credentials, so it no longer sits beside the ciphertext it opens),
+# so an offline copy of that folder (a backup, a synced drive) does not carry it. It
+# defends against nothing that already runs as this user. THERE IS NO ROTATION:
+# lose this value and every stored provider credential plus the persisted terminal
+# scrollback stays sealed forever — the daemon refuses and says so rather than
+# quietly minting a new key over them.
+# CYBORG7_CRED_KEY=
+ENVEOF
+  step "Created $1 (0600) for daemon secrets — it is never overwritten by an update"
 }
 
 # Provision (create/update + enable) the systemd unit so the headless daemon starts
@@ -172,10 +215,12 @@ provision_systemd_unit() {
     scope="system"
     unit_dir="/etc/systemd/system"
     wanted="multi-user.target"
+    env_file="/etc/cyborg7/daemon.env"
   else
     scope="user"
     unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
     wanted="default.target"
+    env_file="${XDG_CONFIG_HOME:-$HOME/.config}/cyborg7/daemon.env"
     # A per-user manager must be reachable (it is NOT in a bare container, a
     # `docker exec` without a user bus, or a non-interactive session with no
     # DBUS_SESSION_BUS_ADDRESS). Probe defensively and fall back GRACEFULLY to the
@@ -191,7 +236,9 @@ provision_systemd_unit() {
   fi
 
   unit_path="$unit_dir/${UNIT_NAME}.service"
-  desired="$(render_unit "$launcher" "$wanted")"
+  # Before the unit, so the file the unit references already exists on a fresh host.
+  ensure_daemon_env_file "$env_file"
+  desired="$(render_unit "$launcher" "$wanted" "$env_file")"
 
   if [ -f "$unit_path" ] && [ "$(cat "$unit_path" 2>/dev/null)" = "$desired" ]; then
     step "systemd unit already up to date ($unit_path)"
