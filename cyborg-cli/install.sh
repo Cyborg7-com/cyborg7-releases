@@ -186,6 +186,19 @@ ENVEOF
 # scope only when the installer runs as root. Idempotent: a byte-identical unit is a
 # no-op; a drifted one is rewritten + daemon-reloaded. Degrades gracefully (prints a
 # manual-start hint) when systemd isn't available — e.g. a container without an init.
+# Does a unit of our name exist in the given scope, per systemd itself? Answers
+# false when systemctl is absent or cannot reach that scope's manager — the caller
+# falls back to a plain file test, so an unreachable user bus never blocks a
+# legitimate system-scope install.
+systemctl_other_scope_has_unit() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  if [ "$1" = "user" ]; then
+    systemctl --user cat "${UNIT_NAME}.service" >/dev/null 2>&1
+  else
+    systemctl cat "${UNIT_NAME}.service" >/dev/null 2>&1
+  fi
+}
+
 provision_systemd_unit() {
   [ "$SKIP_SYSTEMD" = "1" ] && return 0
   if ! command -v systemctl >/dev/null 2>&1; then
@@ -236,6 +249,57 @@ provision_systemd_unit() {
   fi
 
   unit_path="$unit_dir/${UNIT_NAME}.service"
+
+  # GUARD 1 — never add a rival unit in the other systemd scope.
+  #
+  # Scope is chosen from `id -u` alone, so the same host provisioned twice under
+  # different UIDs gets TWO units with the SAME name in two namespaces. That is
+  # never benign. The generated unit passes no --home, so it falls back to
+  # DEFAULT_PASEO_HOME (~/.cyborg7) and the port comes from that home's
+  # config.json:
+  #   • different homes  → split state: two SQLite DBs, two server-ids, two relay
+  #     enrollments, and a phantom extra daemon in the workspace.
+  #   • the SAME home    → `--replace` is strictly per-home, so both units resolve
+  #     the same pid lock and each restart reaps the other. A permanent kill loop.
+  # Measured on a real host: a root-authored system unit from 2026-07-02 and an
+  # installer-provisioned user unit from 2026-07-16 ran side by side for 48 days,
+  # invisible because `systemctl status` without `--user` reports only one of them.
+  #
+  # The rest of this script already knows both scopes exist — the restart probe,
+  # migrate_unit and the restart itself all check system AND user. Only the
+  # provisioner did not; it was written a week after the both-scopes lesson landed
+  # and did not carry it over. Adopt what is there and say so.
+  if [ "$scope" = "system" ]; then
+    other_unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/${UNIT_NAME}.service"
+    other_scope="user"
+  else
+    other_unit="/etc/systemd/system/${UNIT_NAME}.service"
+    other_scope="system"
+  fi
+  # `systemctl cat` also sees /usr/lib and /run units and honours a non-default
+  # unit path; the -f test is the fallback when systemctl cannot answer.
+  if systemctl_other_scope_has_unit "$other_scope" || [ -f "$other_unit" ]; then
+    step "A $UNIT_NAME unit already exists in the $other_scope scope — leaving it in charge."
+    step "Installing a second one would split daemon state (separate home, port and identity)."
+    step "To switch scopes: disable and remove the $other_scope unit first, then re-run this installer."
+    SYSTEMD_PROVISIONED=1
+    return 0
+  fi
+
+  # GUARD 2 — an UPDATE must not create a unit that did not exist a second ago.
+  #
+  # `cyborg daemon update` runs this script with CYBORG_SKIP_RESTART=1, which
+  # skips the restart block below but NOT this function. On a host whose daemon is
+  # managed some other way (a hand-written unit, a container, a bare
+  # `daemon start --foreground`), a routine update would silently gain an enabled
+  # systemd unit nobody asked for. Refreshing one we already own stays allowed —
+  # that is how a template change (e.g. the EnvironmentFile line, CYBORG-871)
+  # reaches existing installs.
+  if [ "${CYBORG_SKIP_RESTART:-0}" = "1" ] && [ ! -f "$unit_path" ]; then
+    step "Update: no existing $UNIT_NAME unit in the $scope scope — not creating one."
+    return 0
+  fi
+
   # Before the unit, so the file the unit references already exists on a fresh host.
   ensure_daemon_env_file "$env_file"
   desired="$(render_unit "$launcher" "$wanted" "$env_file")"
