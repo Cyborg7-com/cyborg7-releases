@@ -407,6 +407,24 @@ step "Done. Restart your shell (or run: export PATH=\"$BIN_DIR:\$PATH\")"
 if [ "$SYSTEMD_PROVISIONED" = "1" ]; then
   step "The headless daemon is managed by systemd ($UNIT_NAME) — it auto-starts on boot."
   step "Check it with:  systemctl --user status $UNIT_NAME   (or 'systemctl status' when installed as root)"
+  restart_hint="systemctl --user restart $UNIT_NAME"
 else
   step "Then run a headless agent host with:  cyborg daemon start --foreground"
+  restart_hint="cyborg daemon restart"
 fi
+
+# An installed, RUNNING daemon is still invisible to every workspace until it is
+# CLAIMED: `cyborg daemon claim` writes daemon-owner + cyborg-relay-url, and the
+# daemon resolves its relay ONCE at boot — so a daemon already started (by systemd
+# above, or by hand) must be restarted after claiming. Printing the sequence here
+# is the difference between "it just works" and a support thread: the installer
+# used to end at "start the daemon", which is exactly where people stopped.
+printf '\n'
+step "Next — connect this machine to your workspace:"
+step "  1. cyborg login --email you@example.com"
+step "  2. cyborg daemon claim        # attaches this daemon to your account"
+step "  3. $restart_hint   # the relay is resolved at boot"
+step "  4. cyborg daemon doctor       # verify: online + claimed"
+printf '\n'
+step "Until it is claimed the daemon runs, but does NOT appear in any workspace."
+step "Full guide: https://docs.cyborg7.com/how-to/add-a-daemon/"
