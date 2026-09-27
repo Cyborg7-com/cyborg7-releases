@@ -12,7 +12,24 @@
 set -eu
 
 REPO="Cyborg7-com/cyborg7-releases"
-VERSION="${1:-latest}"
+# Args: an optional exact version, and/or a worker setup code (worker machine
+# invites): `--code CYB-XXXX-XXXX` (or env CYBORG_SETUP_CODE; legacy alias
+# CYBORG_WORKER_CODE) makes the installer
+# finish with `cyborg daemon join` — no account, no interactive claim.
+VERSION="latest"
+WORKER_CODE="${CYBORG_SETUP_CODE:-${CYBORG_WORKER_CODE:-}}"
+while [ $# -gt 0 ]; do
+  arg="$1"
+  shift
+  case "$arg" in
+    --code)
+      WORKER_CODE="${1:-}"
+      if [ $# -gt 0 ]; then shift; fi
+      ;;
+    --code=*) WORKER_CODE="${arg#*=}" ;;
+    *) VERSION="$arg" ;;
+  esac
+done
 BIN_DIR="${CYBORG_INSTALL_BIN_DIR:-$HOME/.local/bin}"
 APP_DIR="${CYBORG_INSTALL_APP_DIR:-$HOME/.local/share/cyborg-cli}"
 SKIP_PATH_UPDATE="${CYBORG_INSTALL_SKIP_PATH_UPDATE:-0}"
@@ -411,6 +428,25 @@ if [ "$SYSTEMD_PROVISIONED" = "1" ]; then
 else
   step "Then run a headless agent host with:  cyborg daemon start --foreground"
   restart_hint="cyborg daemon restart"
+fi
+
+# Worker machine invites: with a setup code the join happens RIGHT HERE — no
+# account, no interactive claim. `cyborg daemon join` redeems the single-use code,
+# writes daemon-owner + cyborg-relay-url + cyborg-relay-token, and the machine
+# lands scoped to the inviting workspace. The daemon still resolves its relay ONCE
+# at boot, so an already-running daemon (systemd above) needs the restart.
+if [ -n "$WORKER_CODE" ]; then
+  printf '\n'
+  step "Joining the workspace with the provided setup code…"
+  if "$BIN_DIR/cyborg" daemon join --code "$WORKER_CODE"; then
+    step "Joined. If a daemon was already running:  $restart_hint"
+    step "Verify with:  cyborg daemon doctor"
+  else
+    step "Join FAILED. Codes are single-use and expire after 24 hours —"
+    step "ask your workspace admin for a new code, then run:"
+    step "  cyborg daemon join --code CYB-XXXX-XXXX"
+  fi
+  exit 0
 fi
 
 # An installed, RUNNING daemon is still invisible to every workspace until it is
