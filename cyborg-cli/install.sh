@@ -77,7 +77,7 @@ esac
 resolve_version() {
   case "$VERSION" in
     latest | stable | "")
-      ver="$(download "https://raw.githubusercontent.com/$REPO/main/cyborg-cli/version.txt" /dev/stdout 2>/dev/null | tr -d '[:space:]')"
+      ver="$(download "${CYBORG_RELEASES_RAW:-https://raw.githubusercontent.com/$REPO/main/cyborg-cli}/version.txt" /dev/stdout 2>/dev/null | tr -d '[:space:]')"
       [ -n "$ver" ] || die "could not resolve the latest cyborg-cli release"
       printf '%s\n' "$ver"
       ;;
@@ -93,17 +93,35 @@ url="$base_url/$archive"
 
 step "Installing Cyborg CLI ${resolved} (${platform}-${arch})"
 tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT
+# Staged on the same filesystem as app/ so the final swap is a rename, not a copy.
+stage="$APP_DIR/.staging"
+trap 'rm -rf "$tmp" "$stage" "$APP_DIR/app.new"' EXIT
 
 step "Downloading $archive"
 download "$url" "$tmp/$archive"
 
+# Extract and prove the new bundle runs BEFORE touching the installed app: a failed
+# download, extract or smoke check leaves the current install exactly as it was.
 step "Extracting to $APP_DIR"
 mkdir -p "$APP_DIR"
-rm -rf "$APP_DIR/app"
-tar -xzf "$tmp/$archive" -C "$APP_DIR"
-[ -f "$APP_DIR/app/dist/cyborg.js" ] || die "bundle missing app/dist/cyborg.js"
-[ -x "$APP_DIR/app/node/bin/node" ] || die "bundle missing app/node/bin/node"
+rm -rf "$stage" "$APP_DIR/app.new"
+mkdir -p "$stage"
+tar -xzf "$tmp/$archive" -C "$stage" || die "could not extract $archive — the current install is unchanged"
+[ -f "$stage/app/dist/cyborg.js" ] || die "bundle missing app/dist/cyborg.js — the current install is unchanged"
+[ -x "$stage/app/node/bin/node" ] || die "bundle missing app/node/bin/node — the current install is unchanged"
+mv "$stage/app" "$APP_DIR/app.new"
+"$APP_DIR/app.new/node/bin/node" "$APP_DIR/app.new/dist/cyborg.js" --version >/dev/null 2>&1 \
+  || die "the new bundle failed to run --version — the current install is unchanged"
+
+# Swap: the previous app is kept as app.prev (what `cyborg daemon update` rolls back to).
+rm -rf "$APP_DIR/app.prev"
+if [ -d "$APP_DIR/app" ]; then
+  mv "$APP_DIR/app" "$APP_DIR/app.prev"
+fi
+if ! mv "$APP_DIR/app.new" "$APP_DIR/app"; then
+  [ -d "$APP_DIR/app.prev" ] && mv "$APP_DIR/app.prev" "$APP_DIR/app"
+  die "could not move the new bundle into place — restored the previous install"
+fi
 
 step "Writing launcher to $BIN_DIR/cyborg"
 mkdir -p "$BIN_DIR"
@@ -135,7 +153,9 @@ chmod +x "$BIN_DIR/cyborg"
 # exits, leaving the stale build serving); `--foreground` hands the process
 # lifecycle to systemd (Type=simple). Restart=on-failure + the StartLimit* pair
 # trip a crash-looping daemon to a visible `failed` state instead of hammering
-# restarts (mirrors the relay unit's guardrails).
+# restarts (mirrors the relay unit's guardrails). KillMode=process: a restart signals
+# only the daemon, so running agents, MCP servers and the pty-host survive an update;
+# the supervisor reaps its own orphaned daemon processes at boot (daemon-orphan-reaper).
 #
 # EnvironmentFile (CYBORG-871) is how an operator gives the daemon secrets — chiefly
 # CYBORG7_CRED_KEY, the credential-store master key, whose whole point is to live
@@ -162,6 +182,7 @@ StartLimitBurst=5
 Type=simple
 EnvironmentFile=-$3
 ExecStart="$1" daemon start --replace --foreground
+KillMode=process
 Restart=on-failure
 RestartSec=5
 
@@ -360,7 +381,12 @@ provision_systemd_unit() {
 # Apply the update to a RUNNING daemon — otherwise the new bundle just sits on disk
 # while the old process keeps serving (the "I updated but nothing changed" bug). Skip
 # with CYBORG_SKIP_RESTART=1. Best-effort: a restart failure never fails the install.
-if [ "${CYBORG_SKIP_RESTART:-0}" != "1" ] && "$BIN_DIR/cyborg" daemon status >/dev/null 2>&1; then
+# `daemon status` exits 0 whether or not a daemon runs, so ask what it reports: a
+# fresh install must not start a stray detached daemon beside the unit enabled below.
+daemon_running() {
+  "$BIN_DIR/cyborg" daemon status --json 2>/dev/null | grep -Eq '"localDaemon": *"running"'
+}
+if [ "${CYBORG_SKIP_RESTART:-0}" != "1" ] && daemon_running; then
   step "Restarting the running daemon to apply the update"
   if command -v systemctl >/dev/null 2>&1 && { systemctl is-active --quiet cyborg7-daemon || systemctl --user is-active --quiet cyborg7-daemon; } 2>/dev/null; then
     # systemd-managed: the unit's ExecStart must pass `cyborg daemon start --replace`
