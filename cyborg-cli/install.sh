@@ -172,7 +172,7 @@ chmod +x "$BIN_DIR/cyborg"
 render_unit() {
   cat <<EOF
 [Unit]
-Description=Cyborg7 headless daemon
+Description=Cyborg headless daemon
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=120
