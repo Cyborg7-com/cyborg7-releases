@@ -57,6 +57,16 @@ download() {
 
 command -v tar >/dev/null 2>&1 || die "tar is required but not found"
 
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    return 1
+  fi
+}
+
 # Platform/arch — the bundle is platform-specific (native deps).
 os="$(uname -s)"
 case "$os" in
@@ -99,6 +109,21 @@ trap 'rm -rf "$tmp" "$stage" "$APP_DIR/app.new"' EXIT
 
 step "Downloading $archive"
 download "$url" "$tmp/$archive"
+
+# Releases since SHA256SUMS was introduced publish one; a mismatch never installs. An older
+# release has none and installs unverified with a warning (CYBORG_REQUIRE_CHECKSUM=1 refuses).
+if download "$base_url/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
+  expected="$(awk -v f="$archive" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS")"
+  [ -n "$expected" ] || die "SHA256SUMS has no entry for $archive — the current install is unchanged"
+  actual="$(sha256_of "$tmp/$archive")" || die "need sha256sum or shasum to verify $archive"
+  [ "$actual" = "$expected" ] \
+    || die "checksum mismatch for $archive (expected $expected, got $actual) — the current install is unchanged"
+  step "Verified sha256 $actual"
+elif [ "${CYBORG_REQUIRE_CHECKSUM:-0}" = "1" ]; then
+  die "cyborg-cli ${resolved} publishes no SHA256SUMS and CYBORG_REQUIRE_CHECKSUM=1 — the current install is unchanged"
+else
+  printf 'warning: cyborg-cli %s publishes no SHA256SUMS; %s is not checksum-verified\n' "$resolved" "$archive" >&2
+fi
 
 # Extract and prove the new bundle runs BEFORE touching the installed app: a failed
 # download, extract or smoke check leaves the current install exactly as it was.
