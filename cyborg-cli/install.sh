@@ -67,6 +67,20 @@ sha256_of() {
   fi
 }
 
+# The first cyborg-cli release whose workflow published SHA256SUMS.
+SUMS_SINCE="0.3.169"
+
+# True when dotted version $1 >= $2 (a -suffix is ignored). Unparsable counts as new: fail closed.
+version_at_least() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    sub(/-.*/, "", a); sub(/-.*/, "", b)
+    if (a !~ /^[0-9]+(\.[0-9]+)*$/) exit 0
+    na = split(a, x, "."); nb = split(b, y, "."); n = na > nb ? na : nb
+    for (i = 1; i <= n; i++) { if (x[i] + 0 > y[i] + 0) exit 0; if (x[i] + 0 < y[i] + 0) exit 1 }
+    exit 0
+  }'
+}
+
 # Platform/arch — the bundle is platform-specific (native deps).
 os="$(uname -s)"
 case "$os" in
@@ -80,6 +94,19 @@ case "$machine" in
   x86_64 | amd64) arch="x64" ;;
   *) die "unsupported arch: $machine" ;;
 esac
+
+# What this install verified, left for the daemon's next boot (install-report.ts): the
+# installer holds no token, so the daemon reports it as daemon_install_verified.
+checksum_verified=false
+write_install_report() { # $1 = smoke_ok (true|false), $2 = failure (checksum|smoke) or empty
+  report_dir="${PASEO_HOME:-$HOME/.cyborg7}"
+  failure_field=""
+  [ -z "${2:-}" ] || failure_field=", \"failure\": \"$2\""
+  ( umask 077 && mkdir -p "$report_dir" && printf '{"checksum_verified": %s, "smoke_ok": %s, "os": "%s", "arch": "%s"%s}\n' \
+    "$checksum_verified" "$1" "$platform" "$arch" "$failure_field" >"$report_dir/install-report.json" ) 2>/dev/null \
+    || printf 'warning: could not write %s/install-report.json\n' "$report_dir" >&2
+}
+die_checksum() { write_install_report false checksum; die "$1"; }
 
 # Resolve the latest cyborg-cli-v* release. The release repo also hosts frequent
 # desktop/mobile releases, so we read the pinned version from version.txt rather
@@ -110,17 +137,20 @@ trap 'rm -rf "$tmp" "$stage" "$APP_DIR/app.new"' EXIT
 step "Downloading $archive"
 download "$url" "$tmp/$archive"
 
-# Releases since SHA256SUMS was introduced publish one; a mismatch never installs. An older
-# release has none and installs unverified with a warning (CYBORG_REQUIRE_CHECKSUM=1 refuses).
+# Every release from SUMS_SINCE on publishes SHA256SUMS: missing, unlisted or mismatching
+# never installs. An older pin has none and installs with a warning (CYBORG_REQUIRE_CHECKSUM=1 refuses).
 if download "$base_url/SHA256SUMS" "$tmp/SHA256SUMS" 2>/dev/null; then
   expected="$(awk -v f="$archive" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp/SHA256SUMS")"
-  [ -n "$expected" ] || die "SHA256SUMS has no entry for $archive — the current install is unchanged"
+  [ -n "$expected" ] || die_checksum "SHA256SUMS has no entry for $archive — the current install is unchanged"
   actual="$(sha256_of "$tmp/$archive")" || die "need sha256sum or shasum to verify $archive"
   [ "$actual" = "$expected" ] \
-    || die "checksum mismatch for $archive (expected $expected, got $actual) — the current install is unchanged"
+    || die_checksum "checksum mismatch for $archive (expected $expected, got $actual) — the current install is unchanged"
   step "Verified sha256 $actual"
+  checksum_verified=true
+elif version_at_least "$resolved" "$SUMS_SINCE"; then
+  die_checksum "could not download SHA256SUMS for cyborg-cli ${resolved} (published since ${SUMS_SINCE}) — the current install is unchanged"
 elif [ "${CYBORG_REQUIRE_CHECKSUM:-0}" = "1" ]; then
-  die "cyborg-cli ${resolved} publishes no SHA256SUMS and CYBORG_REQUIRE_CHECKSUM=1 — the current install is unchanged"
+  die_checksum "cyborg-cli ${resolved} publishes no SHA256SUMS and CYBORG_REQUIRE_CHECKSUM=1 — the current install is unchanged"
 else
   printf 'warning: cyborg-cli %s publishes no SHA256SUMS; %s is not checksum-verified\n' "$resolved" "$archive" >&2
 fi
@@ -158,15 +188,22 @@ mkdir -p "$BIN_DIR"
 cat >"$BIN_DIR/cyborg" <<EOF
 #!/bin/sh
 export CYBORG7_DOCS_DIR="\${CYBORG7_DOCS_DIR:-$APP_DIR/app/packages/docs/src/content/docs}"
-# Export CYBORG7_SOURCE_DIR so the daemon's cyborg7_read_source MCP tool finds the
-# bundled read-only source snapshot. The tool is git-checkout-gated by default and
-# this bundle has no .git, so without this it would never register (CYBORG-85);
-# @cyborg7/docs-lib trusts this override without requiring .git. The repo-scoped
-# path guard + secret denylist still apply to every read under it.
-export CYBORG7_SOURCE_DIR="\${CYBORG7_SOURCE_DIR:-$APP_DIR/app/source-snapshot}"
 exec "$APP_DIR/app/node/bin/node" "$APP_DIR/app/dist/cyborg.js" "\$@"
 EOF
 chmod +x "$BIN_DIR/cyborg"
+
+# Post-install smoke test through the launcher users run: it must report the version just
+# installed, or the previous app comes back (the failed one is parked as app.new, which the trap clears).
+smoke="$("$BIN_DIR/cyborg" --version 2>/dev/null | tr -d '[:space:]')" || smoke=""
+if [ "$smoke" != "$resolved" ]; then
+  write_install_report false smoke
+  if [ -d "$APP_DIR/app.prev" ] && mv "$APP_DIR/app" "$APP_DIR/app.new" && mv "$APP_DIR/app.prev" "$APP_DIR/app"; then
+    die "smoke test failed: '$BIN_DIR/cyborg --version' printed '${smoke}', expected '${resolved}' — restored the previous install"
+  fi
+  die "smoke test failed: '$BIN_DIR/cyborg --version' printed '${smoke}', expected '${resolved}'"
+fi
+step "Smoke test passed: cyborg --version = $smoke"
+write_install_report true
 
 # Render the systemd unit body. $1 = ABSOLUTE launcher path, $2 = WantedBy target,
 # $3 = ABSOLUTE operator env-file path.
